@@ -27,22 +27,19 @@ class AbsConverter(NodeConverter):
     ) -> bool:
         return True
 
-    @staticmethod
+    @classmethod
     def _is_supported_on_target(
+        cls,
         node: Node,
         neutron_target_spec: NeutronTargetSpec,
         parameters_mapping: dict[str, Parameter],
         custom_delegation_options: CustomDelegationOptions,
     ) -> bool:
-
-        if neutron_target_spec.use_new_flow_neutron_c:
-            # Requirements specified by the new Neutron flow documentation.
-
-            supported_types = [torch.int8, torch.uint8]
-            if not NodeConverter.uses_quantization_type_for_io(
-                node, supported_types, [0], [0]
-            ):
-                return False
+        supported_types = [torch.int8, torch.uint8]
+        if not NodeConverter.uses_quantization_type_for_io(
+            node, supported_types, [0], [0]
+        ):
+            return False
 
         return True
 

@@ -23,7 +23,9 @@ from executorch.backends.cadence.aot.pass_utils import (
 from executorch.backends.cadence.aot.reorder_ops import (
     AdvanceQuantizeOpAboveDefChainPass,
     AdvanceQuantizeOpAboveDefInBranchPass,
+    MovePermuteAfterConcat,
     MoveSliceBeforePermutePass,
+    MoveSliceBeforeViewPass,
     PostponeDequantizeOpBelowUseChainPass,
     PostponePermuteOpBelowSqueezeOrUnsqueezeLikeView,
     PropagateSlice,
@@ -357,6 +359,73 @@ class TestReorderPasses(unittest.TestCase):
             < get_node_pos(converted_graph, exir_ops.edge.aten.permute_copy.default)
         )
 
+    def test_advance_quantize_above_extra_quantizable_op(self) -> None:
+        builder = GraphBuilder()
+        cache_data = torch.randint(-128, 127, (4, 8), dtype=torch.int8)
+        update_data = torch.randint(-128, 127, (2, 8), dtype=torch.int8)
+        cache = builder.placeholder("cache", cache_data)
+        update = builder.placeholder("update", update_data)
+        qparams = (0.25, 3, -128, 127, torch.int8)
+        cache_float = builder.call_operator(
+            op=exir_ops.edge.quantized_decomposed.dequantize_per_tensor.default,
+            args=(cache, *qparams),
+        )
+        update_float = builder.call_operator(
+            op=exir_ops.edge.quantized_decomposed.dequantize_per_tensor.default,
+            args=(update, *qparams),
+        )
+        slice_scatter = builder.call_operator(
+            op=exir_ops.edge.aten.slice_scatter.default,
+            args=(cache_float, update_float, 0, 1, 3, 1),
+        )
+        quantized = builder.call_operator(
+            op=exir_ops.edge.quantized_decomposed.quantize_per_tensor.default,
+            args=(slice_scatter, *qparams),
+        )
+        builder.output([quantized])
+
+        result = transform_and_check_numerics(
+            builder.get_graph_module(),
+            (cache_data, update_data),
+            AdvanceQuantizeOpAboveDefChainPass(
+                extra_quantizable_ops={exir_ops.edge.aten.slice_scatter.default: (0, 1)}
+            ),
+        )
+
+        self.assertTrue(result.modified)
+        self.assertEqual(
+            2,
+            count_node(
+                result.graph_module,
+                exir_ops.edge.quantized_decomposed.quantize_per_tensor.default,
+            ),
+        )
+        scatter_nodes = result.graph_module.graph.find_nodes(
+            op="call_function", target=exir_ops.edge.aten.slice_scatter.default
+        )
+        self.assertEqual(1, len(scatter_nodes))
+        scatter_node = scatter_nodes[0]
+        self.assertEqual((0, 1, 3, 1), scatter_node.args[2:])
+        self.assertEqual(torch.int8, scatter_node.meta["val"].dtype)
+
+        for scatter_input in scatter_node.args[:2]:
+            self.assertIsInstance(scatter_input, torch.fx.Node)
+            scatter_input = cast(torch.fx.Node, scatter_input)
+            self.assertEqual(
+                exir_ops.edge.quantized_decomposed.quantize_per_tensor.default,
+                scatter_input.target,
+            )
+            self.assertEqual(torch.int8, scatter_input.meta["val"].dtype)
+
+            quant_input = scatter_input.args[0]
+            self.assertIsInstance(quant_input, torch.fx.Node)
+            quant_input = cast(torch.fx.Node, quant_input)
+            self.assertEqual(torch.float32, quant_input.meta["val"].dtype)
+            dequant_input = quant_input.args[0]
+            self.assertIsInstance(dequant_input, torch.fx.Node)
+            dequant_input = cast(torch.fx.Node, dequant_input)
+            self.assertEqual(torch.int8, dequant_input.meta["val"].dtype)
+
     def test_postpone_dequantize1(self) -> None:
         builder = GraphBuilder()
         x_data = torch.randn(1, 16, 32, 6, dtype=torch.float32)
@@ -638,6 +707,154 @@ class TestReorderPasses(unittest.TestCase):
         self.assertTrue(nodes[3] == exir_ops.edge.aten.permute_copy)
 
 
+class TestMovePermuteAfterConcat(unittest.TestCase):
+    def test_matching_single_user_permutes_moved_after_cat(self) -> None:
+        x_data = torch.randn(1, 16, 32)
+        y_data = torch.randn(80, 16, 32)
+        builder = GraphBuilder()
+        x = builder.placeholder("x", x_data)
+        y = builder.placeholder("y", y_data)
+        permutation = [1, 2, 0]
+        permuted_x = builder.call_operator(
+            exir_ops.edge.aten.permute_copy.default,
+            args=(x, permutation),
+        )
+        permuted_y = builder.call_operator(
+            exir_ops.edge.aten.permute_copy.default,
+            args=(y, permutation),
+        )
+        cat = builder.call_operator(
+            exir_ops.edge.aten.cat.default,
+            args=([permuted_x, permuted_y], 2),
+        )
+        builder.output([cat])
+
+        result = transform_and_check_numerics(
+            builder.get_graph_module(),
+            (x_data, y_data),
+            MovePermuteAfterConcat(),
+        )
+
+        self.assertTrue(result.modified)
+        converted = result.graph_module
+        self.assertEqual(
+            get_compute_nodes_in_gm(converted),
+            [exir_ops.edge.aten.cat, exir_ops.edge.aten.permute_copy],
+        )
+        cat_nodes = converted.graph.find_nodes(
+            op="call_function", target=exir_ops.edge.aten.cat.default
+        )
+        self.assertEqual(len(cat_nodes), 1)
+        self.assertEqual(cat_nodes[0].args[1], 0)
+        placeholder_nodes = converted.graph.find_nodes(op="placeholder")
+        self.assertEqual(cat_nodes[0].args[0], placeholder_nodes)
+
+    def test_repeated_permute_input_not_moved(self) -> None:
+        x_data = torch.randn(1, 16, 32)
+        builder = GraphBuilder()
+        x = builder.placeholder("x", x_data)
+        permuted_x = builder.call_operator(
+            exir_ops.edge.aten.permute_copy.default,
+            args=(x, [1, 2, 0]),
+        )
+        cat = builder.call_operator(
+            exir_ops.edge.aten.cat.default,
+            args=([permuted_x, permuted_x], 2),
+        )
+        builder.output([cat])
+
+        result = transform_and_check_numerics(
+            builder.get_graph_module(),
+            (x_data,),
+            MovePermuteAfterConcat(),
+        )
+
+        self.assertFalse(result.modified)
+        self.assertEqual(
+            get_compute_nodes_in_gm(result.graph_module),
+            [exir_ops.edge.aten.permute_copy, exir_ops.edge.aten.cat],
+        )
+
+    def test_different_permutations_not_moved(self) -> None:
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(2, 3, 4))
+        y = builder.placeholder("y", torch.randn(4, 3, 5))
+        permuted_x = builder.call_operator(
+            exir_ops.edge.aten.permute_copy.default,
+            args=(x, [1, 2, 0]),
+        )
+        permuted_y = builder.call_operator(
+            exir_ops.edge.aten.permute_copy.default,
+            args=(y, [1, 0, 2]),
+        )
+        cat = builder.call_operator(
+            exir_ops.edge.aten.cat.default,
+            args=([permuted_x, permuted_y], 2),
+        )
+        builder.output([cat])
+
+        result = cast(PassResult, MovePermuteAfterConcat()(builder.get_graph_module()))
+
+        self.assertFalse(result.modified)
+        self.assertEqual(
+            count_node(result.graph_module, exir_ops.edge.aten.permute_copy.default),
+            2,
+        )
+
+    def test_permute_with_another_user_not_moved(self) -> None:
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(1, 16, 32))
+        y = builder.placeholder("y", torch.randn(80, 16, 32))
+        permutation = [1, 2, 0]
+        permuted_x = builder.call_operator(
+            exir_ops.edge.aten.permute_copy.default,
+            args=(x, permutation),
+        )
+        permuted_y = builder.call_operator(
+            exir_ops.edge.aten.permute_copy.default,
+            args=(y, permutation),
+        )
+        cat = builder.call_operator(
+            exir_ops.edge.aten.cat.default,
+            args=([permuted_x, permuted_y], 2),
+        )
+        other_user = builder.call_operator(
+            exir_ops.edge.aten.abs.default,
+            args=(permuted_x,),
+        )
+        builder.output([cat, other_user])
+
+        result = cast(PassResult, MovePermuteAfterConcat()(builder.get_graph_module()))
+
+        self.assertFalse(result.modified)
+        self.assertEqual(
+            count_node(result.graph_module, exir_ops.edge.aten.permute_copy.default),
+            2,
+        )
+
+    def test_non_permuted_input_not_moved(self) -> None:
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(1, 16, 32))
+        y = builder.placeholder("y", torch.randn(16, 32, 80))
+        permuted_x = builder.call_operator(
+            exir_ops.edge.aten.permute_copy.default,
+            args=(x, [1, 2, 0]),
+        )
+        cat = builder.call_operator(
+            exir_ops.edge.aten.cat.default,
+            args=([permuted_x, y], 2),
+        )
+        builder.output([cat])
+
+        result = cast(PassResult, MovePermuteAfterConcat()(builder.get_graph_module()))
+
+        self.assertFalse(result.modified)
+        self.assertEqual(
+            count_node(result.graph_module, exir_ops.edge.aten.permute_copy.default),
+            1,
+        )
+
+
 class TestMoveSliceBeforePermutePass(unittest.TestCase):
     def test_basic_move(self) -> None:
         """permute → slice becomes slice → permute."""
@@ -763,6 +980,218 @@ class TestMoveSliceBeforePermutePass(unittest.TestCase):
             MoveSliceBeforePermutePass(),
         )
         self.assertTrue(result.modified)
+
+
+class TestMoveSliceBeforeViewPass(unittest.TestCase):
+    @staticmethod
+    def _shapes_by_target(
+        gm: torch.fx.GraphModule, target: object
+    ) -> list[tuple[int, ...]]:
+        """Output shapes of every node with the given target, in graph order."""
+        return [
+            tuple(node.meta["val"].shape)
+            for node in gm.graph.nodes
+            if node.target == target
+        ]
+
+    def _assert_slice_and_view_shapes(
+        self,
+        gm: torch.fx.GraphModule,
+        slice_shapes: list[tuple[int, ...]],
+        view_shapes: list[tuple[int, ...]],
+    ) -> None:
+        self.assertEqual(
+            self._shapes_by_target(gm, exir_ops.edge.aten.slice_copy.Tensor),
+            slice_shapes,
+        )
+        self.assertEqual(
+            self._shapes_by_target(gm, exir_ops.edge.aten.view_copy.default),
+            view_shapes,
+        )
+
+    def test_strided_innermost_move(self) -> None:
+        """Splitting the last dim into [...,2] then slicing that 2 (innermost,
+        width 1) becomes a strided slice on the pre-view tensor, then view."""
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(1, 16, 256))
+        viewed = builder.call_operator(
+            op=exir_ops.edge.aten.view_copy.default,
+            args=(x, [1, 16, 4, 32, 2]),
+        )
+        sliced = builder.call_operator(
+            op=exir_ops.edge.aten.slice_copy.Tensor,
+            args=(viewed, 4, 0, 1, 1),
+        )
+        builder.output([sliced])
+        original = builder.get_graph_module()
+
+        result = transform_and_check_numerics(
+            original,
+            (torch.randn(1, 16, 256),),
+            MoveSliceBeforeViewPass(),
+        )
+        self.assertTrue(result.modified)
+
+        nodes = get_compute_nodes_in_gm(result.graph_module)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[0], exir_ops.edge.aten.slice_copy)
+        self.assertEqual(nodes[1], exir_ops.edge.aten.view_copy)
+        # The strided pre-view slice [0:255:2] keeps 128 of the 256 elements,
+        # then the view restores the (sliced) viewed shape.
+        self._assert_slice_and_view_shapes(
+            result.graph_module, [(1, 16, 128)], [(1, 16, 4, 32, 1)]
+        )
+
+    def test_fanout_both_slices_move(self) -> None:
+        """A view that fans out to even/odd slices: each is pushed before the
+        view independently and the now-dead shared view is removed."""
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(1, 16, 256))
+        viewed = builder.call_operator(
+            op=exir_ops.edge.aten.view_copy.default,
+            args=(x, [1, 16, 4, 32, 2]),
+        )
+        even = builder.call_operator(
+            op=exir_ops.edge.aten.slice_copy.Tensor,
+            args=(viewed, 4, 0, 1, 1),
+        )
+        odd = builder.call_operator(
+            op=exir_ops.edge.aten.slice_copy.Tensor,
+            args=(viewed, 4, 1, 2, 1),
+        )
+        builder.output([even, odd])
+        original = builder.get_graph_module()
+
+        result = transform_and_check_numerics(
+            original,
+            (torch.randn(1, 16, 256),),
+            MoveSliceBeforeViewPass(),
+        )
+        self.assertTrue(result.modified)
+
+        nodes = get_compute_nodes_in_gm(result.graph_module)
+        self.assertEqual(sum(n == exir_ops.edge.aten.slice_copy for n in nodes), 2)
+        self.assertEqual(sum(n == exir_ops.edge.aten.view_copy for n in nodes), 2)
+        # Each fanned-out slice keeps half the elements and gets its own view.
+        self._assert_slice_and_view_shapes(
+            result.graph_module,
+            [(1, 16, 128), (1, 16, 128)],
+            [(1, 16, 4, 32, 1), (1, 16, 4, 32, 1)],
+        )
+
+    def test_contiguous_outermost_move(self) -> None:
+        """Slicing the outermost factor of a split dim → contiguous pre-view
+        slice, then view."""
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(1, 16, 256))
+        viewed = builder.call_operator(
+            op=exir_ops.edge.aten.view_copy.default,
+            args=(x, [1, 16, 2, 128]),
+        )
+        sliced = builder.call_operator(
+            op=exir_ops.edge.aten.slice_copy.Tensor,
+            args=(viewed, 2, 0, 1, 1),
+        )
+        builder.output([sliced])
+        original = builder.get_graph_module()
+
+        result = transform_and_check_numerics(
+            original,
+            (torch.randn(1, 16, 256),),
+            MoveSliceBeforeViewPass(),
+        )
+        self.assertTrue(result.modified)
+
+        nodes = get_compute_nodes_in_gm(result.graph_module)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[0], exir_ops.edge.aten.slice_copy)
+        self.assertEqual(nodes[1], exir_ops.edge.aten.view_copy)
+        self._assert_slice_and_view_shapes(
+            result.graph_module, [(1, 16, 128)], [(1, 16, 1, 128)]
+        )
+
+    def test_contiguous_outer_factor_width_two_move(self) -> None:
+        """Slicing the first two of the outermost factor (size 4) is still a
+        contiguous pre-view slice [0:128], then view → (1,16,2,32,2)."""
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(1, 16, 256))
+        viewed = builder.call_operator(
+            op=exir_ops.edge.aten.view_copy.default,
+            args=(x, [1, 16, 4, 32, 2]),
+        )
+        sliced = builder.call_operator(
+            op=exir_ops.edge.aten.slice_copy.Tensor,
+            args=(viewed, 2, 0, 2, 1),
+        )
+        builder.output([sliced])
+        original = builder.get_graph_module()
+
+        result = transform_and_check_numerics(
+            original,
+            (torch.randn(1, 16, 256),),
+            MoveSliceBeforeViewPass(),
+        )
+        self.assertTrue(result.modified)
+
+        nodes = get_compute_nodes_in_gm(result.graph_module)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[0], exir_ops.edge.aten.slice_copy)
+        self.assertEqual(nodes[1], exir_ops.edge.aten.view_copy)
+        self._assert_slice_and_view_shapes(
+            result.graph_module, [(1, 16, 128)], [(1, 16, 2, 32, 2)]
+        )
+
+    def test_strided_outer_factor_not_moved(self) -> None:
+        """A strided (step>1, width>1) selection of the outermost factor is a
+        block-strided pattern, not a single pre-view slice → left unchanged."""
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(1, 16, 256))
+        viewed = builder.call_operator(
+            op=exir_ops.edge.aten.view_copy.default,
+            args=(x, [1, 16, 4, 32, 2]),
+        )
+        sliced = builder.call_operator(
+            op=exir_ops.edge.aten.slice_copy.Tensor,
+            args=(viewed, 2, 0, 4, 2),
+        )
+        builder.output([sliced])
+        original = builder.get_graph_module()
+
+        result = cast(PassResult, MoveSliceBeforeViewPass()(original))
+        self.assertFalse(result.modified)
+
+    def test_block_strided_not_moved(self) -> None:
+        """Slicing a middle factor yields a block-strided selection that is not a
+        single pre-view slice → left unchanged."""
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(1, 16, 256))
+        viewed = builder.call_operator(
+            op=exir_ops.edge.aten.view_copy.default,
+            args=(x, [1, 16, 4, 2, 32]),
+        )
+        sliced = builder.call_operator(
+            op=exir_ops.edge.aten.slice_copy.Tensor,
+            args=(viewed, 3, 0, 1, 1),
+        )
+        builder.output([sliced])
+        original = builder.get_graph_module()
+
+        result = cast(PassResult, MoveSliceBeforeViewPass()(original))
+        self.assertFalse(result.modified)
+
+    def test_non_view_input_no_change(self) -> None:
+        """A slice whose input is not a view is left unchanged."""
+        builder = GraphBuilder()
+        x = builder.placeholder("x", torch.randn(1, 16, 256))
+        sliced = builder.call_operator(
+            op=exir_ops.edge.aten.slice_copy.Tensor,
+            args=(x, 2, 0, 128, 1),
+        )
+        builder.output([sliced])
+        original = builder.get_graph_module()
+
+        result = cast(PassResult, MoveSliceBeforeViewPass()(original))
+        self.assertFalse(result.modified)
 
 
 class TestPropagateSlice(unittest.TestCase):

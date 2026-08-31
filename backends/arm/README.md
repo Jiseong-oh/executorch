@@ -21,7 +21,20 @@ In addition, the following deployment paths are supported by this backend:
   - Full testing is available in tree using Corstone&trade; Fixed Virtual Platforms (FVP).
 - Linux target support for VGF capable targets, using the executor_runner.
 
-More information on TOSA can be found here: https://www.mlplatform.org/tosa/tosa_spec.html.
+More information on TOSA can be found here: https://github.com/arm/tosa-specification.
+
+## Public API Boundary
+
+The Arm backend public Python API is the set of symbols tracked in
+`backends/arm/public_api_manifests/api_manifest_running.toml`. Other modules,
+helpers, scripts, and directory layouts in this subtree are implementation
+details and may change without deprecation.
+
+In particular, `backends/arm/tosa` contains shared lowering implementation for
+Arm backends. It is not a stable public package except for symbols explicitly
+listed in the public API manifest. Prefer the target-specific public APIs in
+`executorch.backends.arm.ethosu` and `executorch.backends.arm.vgf` for
+application code.
 
 ## Directory Layout
 
@@ -251,14 +264,14 @@ Below is an overview of some of the testing options this script provides:
 | `test_arm_backend.sh test_pytest_ops_vkml`         | Runs operator unit tests for VKML/VGF specific use-cases.    |
 | `test_arm_backend.sh test_pytest_models_vkml`      | Runs model unit tests for VKML/VGF specific use-cases.       |
 | `test_arm_backend.sh test_run_vkml`                | Runs end-to-end unit tests for VKML/VGF specific use-cases.  |
-| `test_arm_backend.sh test_model_smollm2_135M`      | Runs some models with Corstone FVP.                          |
+| `test_arm_backend.sh test_model_smollm2_135M_ethos_u85`      | Runs smollm2_135M for Ethos-U85 specific use-cases.                          |
 | `test_arm_backend.sh test_ootb_tests_ethos_u`      | Runs out-of-the-box tests for Ethos-U.                       |
 | `test_arm_backend.sh test_ootb_tests_tosa`         | Runs out-of-the-box tests for TOSA.                          |
 | `test_arm_backend.sh test_ootb_tests_vgf`          | Runs out-of-the-box tests for VKML/VGF.                      |
 | `test_arm_backend.sh test_deit_e2e_ethos_u`        | Runs DEiT end-to-end tests on Ethos-U.                       |
 | `test_arm_backend.sh test_smaller_stories_llama_tosa` | Runs Llama model tests for TOSA.                          |
 | `test_arm_backend.sh test_smaller_stories_llama_vkml` | Runs Llama model tests for VKML/VGF.                      |
-| `test_arm_backend.sh test_memory_allocation`       | Runs memory allocation tests for Ethos-U specific targets    |
+| `test_arm_backend.sh test_runtime_ethos_u`       | Runs runtime tests for Ethos-U specific targets    |
 
 For more information, please refer to the `backends/arm/test/test_arm_backend.sh` script.
 
@@ -347,11 +360,16 @@ List of model specific and optional passes:
        - Supported Ops:
          - torch.ops.aten.to.\[dtype|dtype_layout\]
          - exir_ops.edge.dim_order_ops.\_to_dim_order_copy.default
-    2. Post-process argmax outputs:
-       - Inserts an int64->int32 cast after the argmax operations that produce int64 outputs:
+    2. Post-process argmax and argmin outputs:
+       - Converts only downstream paths whose statically inferred values remain
+         within the int32 range.
+       - Leaves unsafe direct consumers on int64 and inserts int64 boundary
+         casts where converted paths reach unsafe consumers or model outputs.
        - Supported Ops:
          - torch.ops.aten.argmax.default
          - exir_ops.edge.aten.argmax.default
+         - torch.ops.aten.argmin.default
+         - exir_ops.edge.aten.argmin.default
   - Example usage:
     - (Functionality 1) backends/arm/test/models/stable_diffusion/test_T5EncoderModel.py
     - (Functionality 2) backends/arm/test/models/stable_diffusion/test_CLIPTextModelWithProjection.py

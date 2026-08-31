@@ -270,6 +270,18 @@ class Adapter final {
 #endif /* VK_KHR_cooperative_matrix */
   }
 
+  // True when VK_COMPONENT_TYPE_SINT8_KHR is enumerated in the device's
+  // cooperative matrix property list — required for coopmat<int8> shaders.
+  inline bool supports_int8_cooperative_matrix() const {
+#if defined(ETVK_FORCE_NO_EXTENSIONS)
+    return false;
+#elif defined(VK_KHR_cooperative_matrix)
+    return physical_device_.supports_int8_coopmat;
+#else
+    return false;
+#endif /* VK_KHR_cooperative_matrix */
+  }
+
   inline bool supports_int16_shader_types() {
 #ifdef ETVK_FORCE_NO_EXTENSIONS
     return false;
@@ -413,6 +425,30 @@ class Adapter final {
 
   inline uint32_t max_buffer_numel() const {
     return physical_device_.properties.limits.maxStorageBufferRange;
+  }
+
+  inline utils::uvec3 max_compute_workgroup_count() const {
+    const auto& limits = physical_device_.properties.limits;
+    return {
+        limits.maxComputeWorkGroupCount[0],
+        limits.maxComputeWorkGroupCount[1],
+        limits.maxComputeWorkGroupCount[2]};
+  }
+
+  inline utils::uvec3 max_compute_workgroup_size() const {
+    const auto& limits = physical_device_.properties.limits;
+    return {
+        limits.maxComputeWorkGroupSize[0],
+        limits.maxComputeWorkGroupSize[1],
+        limits.maxComputeWorkGroupSize[2]};
+  }
+
+  inline uint32_t max_compute_workgroup_invocations() const {
+    return physical_device_.properties.limits.maxComputeWorkGroupInvocations;
+  }
+
+  inline uint32_t recommended_lwg_nthreads() const {
+    return 64u;
   }
 
   // Command Buffer Submission

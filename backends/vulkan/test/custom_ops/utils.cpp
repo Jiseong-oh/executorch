@@ -737,6 +737,8 @@ bool ValueSpec::validate_against_reference(
   }
 
   // Element-wise comparison with both absolute and relative tolerance
+  size_t num_mismatched = 0;
+  size_t first_mismatch = 0;
   for (size_t i = 0; i < computed_data.size(); ++i) {
     float diff = std::abs(computed_data[i] - reference_data[i]);
     float abs_ref = std::abs(reference_data[i]);
@@ -746,14 +748,50 @@ bool ValueSpec::validate_against_reference(
     bool rel_tolerance_ok = diff <= rel_tolerance * abs_ref;
 
     if (!abs_tolerance_ok && !rel_tolerance_ok) {
-      std::cout << "Mismatch at element " << i
-                << ": computed=" << computed_data[i]
-                << ", reference=" << reference_data[i] << ", diff=" << diff
-                << ", abs_tolerance=" << abs_tolerance
-                << ", rel_tolerance=" << rel_tolerance
-                << ", rel_threshold=" << (rel_tolerance * abs_ref) << std::endl;
-      return false;
+      if (num_mismatched == 0) {
+        first_mismatch = i;
+        std::cout << "Mismatch at element " << i
+                  << ": computed=" << computed_data[i]
+                  << ", reference=" << reference_data[i] << ", diff=" << diff
+                  << ", abs_tolerance=" << abs_tolerance
+                  << ", rel_tolerance=" << rel_tolerance
+                  << ", rel_threshold=" << (rel_tolerance * abs_ref)
+                  << std::endl;
+      }
+      num_mismatched++;
     }
+  }
+  if (num_mismatched > 0) {
+    std::cout << "  total mismatched: " << num_mismatched << " / "
+              << computed_data.size() << " (first at " << first_mismatch << ")"
+              << std::endl;
+    // For 2D outputs, print a per-16x16-tile mismatch-count map to expose
+    // the spatial structure of the failure (e.g. zeroed MMA subtiles).
+    if (sizes.size() == 2) {
+      const int64_t Mr = sizes[0];
+      const int64_t Nc = sizes[1];
+      std::cout << "  16x16-tile mismatch counts (rows=M/16, cols=N/16):"
+                << std::endl;
+      for (int64_t ti = 0; ti < (Mr + 15) / 16; ++ti) {
+        std::cout << "    ";
+        for (int64_t tj = 0; tj < (Nc + 15) / 16; ++tj) {
+          int count = 0;
+          for (int64_t r = ti * 16; r < std::min(Mr, (ti + 1) * 16); ++r) {
+            for (int64_t c = tj * 16; c < std::min(Nc, (tj + 1) * 16); ++c) {
+              float diff = std::abs(
+                  computed_data[r * Nc + c] - reference_data[r * Nc + c]);
+              float abs_ref = std::abs(reference_data[r * Nc + c]);
+              if (diff > abs_tolerance && diff > rel_tolerance * abs_ref) {
+                count++;
+              }
+            }
+          }
+          std::cout << std::setw(4) << count;
+        }
+        std::cout << std::endl;
+      }
+    }
+    return false;
   }
 
   if (debugging()) {
@@ -916,8 +954,8 @@ void BenchmarkResult::add_iter_timing(float time_us) {
 void BenchmarkResult::add_shader_timing(
     const std::string& shader_name,
     float time_us,
-    const uint32_t global_wg[3],
-    const uint32_t local_wg[3]) {
+    const uint32_t gwg[3],
+    const uint32_t lwg[3]) {
   // Find existing shader timing or create new one
   for (auto& st : shader_timings_) {
     if (st.shader_name == shader_name) {
@@ -930,12 +968,12 @@ void BenchmarkResult::add_shader_timing(
   ShaderTiming new_timing;
   new_timing.shader_name = shader_name;
   new_timing.iter_timings_us.push_back(time_us);
-  new_timing.global_wg_size[0] = global_wg[0];
-  new_timing.global_wg_size[1] = global_wg[1];
-  new_timing.global_wg_size[2] = global_wg[2];
-  new_timing.local_wg_size[0] = local_wg[0];
-  new_timing.local_wg_size[1] = local_wg[1];
-  new_timing.local_wg_size[2] = local_wg[2];
+  new_timing.gwg[0] = gwg[0];
+  new_timing.gwg[1] = gwg[1];
+  new_timing.gwg[2] = gwg[2];
+  new_timing.lwg[0] = lwg[0];
+  new_timing.lwg[1] = lwg[1];
+  new_timing.lwg[2] = lwg[2];
   shader_timings_.push_back(std::move(new_timing));
 }
 
@@ -1030,12 +1068,11 @@ void BenchmarkResult::print_summary(
       const auto& st = shader_timings_[0];
       std::cout << std::left << std::setw(OPERATOR_NAME_WIDTH)
                 << truncate_shader_name(st.shader_name) << " " << std::left
-                << std::setw(GLOBAL_WG_WIDTH)
-                << format_wg_size(st.global_wg_size) << std::left
-                << std::setw(LOCAL_WG_WIDTH) << format_wg_size(st.local_wg_size)
-                << std::left << std::setw(KERNEL_NAME_WIDTH)
-                << get_kernel_name() << std::right << " "
-                << std::setw(SIZE_INFO_WIDTH) << size_info
+                << std::setw(GLOBAL_WG_WIDTH) << format_wg_size(st.gwg)
+                << std::left << std::setw(LOCAL_WG_WIDTH)
+                << format_wg_size(st.lwg) << std::left
+                << std::setw(KERNEL_NAME_WIDTH) << get_kernel_name()
+                << std::right << " " << std::setw(SIZE_INFO_WIDTH) << size_info
                 << std::setw(TIMING_WIDTH) << std::fixed << std::setprecision(3)
                 << get_avg_time_us() << " μs " << std::setw(GFLOPS_WIDTH)
                 << std::fixed << std::setprecision(3) << total_gflops
@@ -1050,10 +1087,9 @@ void BenchmarkResult::print_summary(
         // Shader lines don't show test case info
         std::cout << std::left << std::setw(OPERATOR_NAME_WIDTH)
                   << truncate_shader_name(st.shader_name) << " " << std::left
-                  << std::setw(GLOBAL_WG_WIDTH)
-                  << format_wg_size(st.global_wg_size) << std::left
-                  << std::setw(LOCAL_WG_WIDTH)
-                  << format_wg_size(st.local_wg_size) << std::left
+                  << std::setw(GLOBAL_WG_WIDTH) << format_wg_size(st.gwg)
+                  << std::left << std::setw(LOCAL_WG_WIDTH)
+                  << format_wg_size(st.lwg) << std::left
                   << std::setw(KERNEL_NAME_WIDTH) << "" << std::right << " "
                   << std::setw(SIZE_INFO_WIDTH) << "" << std::setw(TIMING_WIDTH)
                   << std::fixed << std::setprecision(3) << shader_avg_time
@@ -1366,6 +1402,10 @@ ComputeGraph setup_compute_graph(
     int op_invocations_per_execute) {
   GraphConfig config;
   config.enable_querypool = true;
+  // Default-on (opt-out via TestCase::set_force_resize(false)): force every
+  // DynamicDispatchNode to run its resize function on each execute(),
+  // exercising the op's resize formula even when input shapes are unchanged.
+  config.force_resize = test_case.get_force_resize();
   ComputeGraph graph(config);
 
   std::vector<ValueRef> input_values;
@@ -1584,8 +1624,8 @@ BenchmarkResult execute_test_case(
         result.add_shader_timing(
             shader_result.kernel_name,
             duration_us,
-            shader_result.metadata.global_workgroup_size,
-            shader_result.metadata.local_workgroup_size);
+            shader_result.metadata.gwg,
+            shader_result.metadata.lwg);
       }
     }
     // gpu_time_us aggregates chained_dispatches worth of shader runs; divide
@@ -1838,8 +1878,6 @@ TestResult execute_test_cases(
                       << result.get_kernel_name() << std::endl;
             print_valuespec_data(output_spec, "vulkan output");
             print_valuespec_data(output_spec, "ref output", true);
-
-            throw std::runtime_error("Correctness validation failed");
           }
         }
 
@@ -1895,6 +1933,14 @@ TestResult execute_test_cases(
 
   print_separator();
   std::cout << "Completed " << results.size() << " test cases" << std::endl;
+
+  // Hard-fail if any correctness check failed. The per-case loop above keeps
+  // running after a mismatch (so the full pass/fail matrix and per-16x16-tile
+  // mismatch maps are printed for debugging) rather than aborting on the first
+  // failure; throwing here preserves the original abort-on-mismatch behavior.
+  if (any_correctness_failed) {
+    throw std::runtime_error("Correctness validation failed");
+  }
 
   return results;
 }
@@ -1977,10 +2023,19 @@ void print_valuespec_data(
       break;
     }
     case vkapi::kHalf: {
+      if (print_ref_data) {
+        const auto& ref = spec.get_ref_float_data();
+        for (size_t i = 0; i < print_count; ++i) {
+          std::cout << ref[i];
+          if (i < print_count - 1)
+            std::cout << ", ";
+        }
+        break;
+      }
       const auto& data = spec.get_half_data();
       for (size_t i = 0; i < print_count; ++i) {
-        // Convert uint16_t back to float for display
-        float value = data[i] / 32767.0f;
+        // Convert IEEE 754 half-precision bit pattern back to float.
+        float value = half_to_float(data[i]);
         std::cout << value;
         if (i < print_count - 1)
           std::cout << ", ";
@@ -2103,11 +2158,9 @@ ValueRef quantized_weights_canvas(
     const ValueRef weight_ref) {
   const auto original_sizes = graph.sizes_of(weight_ref);
 
-  // Get the 2 highest values of original_sizes
   std::vector<int64_t> sorted_sizes = original_sizes;
   std::sort(sorted_sizes.begin(), sorted_sizes.end(), std::greater<int64_t>());
   int64_t largest1 = sorted_sizes.size() > 0 ? sorted_sizes[0] : 0;
-  int64_t largest2 = sorted_sizes.size() > 1 ? sorted_sizes[1] : 0;
 
   std::vector<int64_t> final_sizes = {1, largest1, largest1};
 
@@ -2133,19 +2186,14 @@ ValueRef quantized_weights_canvas(
   ValueRef packed_weight = graph.add_tensor(
       final_sizes, vkapi::kInt, utils::kTexture3D, utils::kWidthPacked);
 
-  utils::uvec3 global_wg_size{
-      utils::div_up(utils::safe_downcast<uint32_t>(largest1), uint32_t(4)),
-      utils::safe_downcast<uint32_t>(largest2),
-      utils::safe_downcast<uint32_t>(std::min(largest1, int64_t(2048)))};
-
   std::string kernel_name = "packed_int32_canvas";
   add_storage_type_suffix(kernel_name, graph.storage_type_of(packed_weight));
 
   graph.prepack_nodes().emplace_back(new PrepackNode(
       graph,
       VK_KERNEL_FROM_STR(kernel_name),
-      graph.create_global_wg_size(packed_weight),
-      graph.create_local_wg_size(packed_weight),
+      graph.create_gwg(packed_weight),
+      graph.create_lwg(packed_weight),
       weight_ref,
       packed_weight,
       // UBOs
@@ -2161,11 +2209,9 @@ ValueRef quantized_weights_canvas(
 ValueRef float_tensor_canvas(ComputeGraph& graph, const ValueRef weight_ref) {
   const auto original_sizes = graph.sizes_of(weight_ref);
 
-  // Get the 2 highest values of original_sizes
   std::vector<int64_t> sorted_sizes = original_sizes;
   std::sort(sorted_sizes.begin(), sorted_sizes.end(), std::greater<int64_t>());
   int64_t largest1 = sorted_sizes.size() > 0 ? sorted_sizes[0] : 0;
-  int64_t largest2 = sorted_sizes.size() > 1 ? sorted_sizes[1] : 0;
 
   std::vector<int64_t> final_sizes = {1, largest1, largest1};
 
@@ -2191,16 +2237,11 @@ ValueRef float_tensor_canvas(ComputeGraph& graph, const ValueRef weight_ref) {
   ValueRef packed_weight = graph.add_tensor(
       final_sizes, vkapi::kFloat, utils::kTexture3D, utils::kWidthPacked);
 
-  utils::uvec3 global_wg_size{
-      utils::div_up(utils::safe_downcast<uint32_t>(largest1), uint32_t(4)),
-      utils::safe_downcast<uint32_t>(largest2),
-      utils::safe_downcast<uint32_t>(std::min(largest1, int64_t(2048)))};
-
   graph.prepack_nodes().emplace_back(new PrepackNode(
       graph,
       VK_KERNEL_FROM_STR("float_canvas"),
-      graph.create_global_wg_size(packed_weight),
-      graph.create_local_wg_size(packed_weight),
+      graph.create_gwg(packed_weight),
+      graph.create_lwg(packed_weight),
       weight_ref,
       packed_weight,
       // UBOs

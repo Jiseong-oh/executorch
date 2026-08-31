@@ -96,16 +96,12 @@ class NeutronTargetSpec:
     The functionality for probing the properties of Neutron Target.
     """
 
-    def __init__(self, target: str, use_new_flow_neutron_c: bool = False):
+    def __init__(self, target: str):
 
         converter_manager = NeutronConverterManager()
         converter_manager.verify_target(target)
         neutron_converter = converter_manager.get_converter()
         self.neutron_target = neutron_converter.getNeutronTarget(target)
-
-        # The new neutron converter flow has different constraints for supported operators. These need to be addressed when
-        # deciding is operator is delegated or not in _is_supported_on_target().
-        self.use_new_flow_neutron_c = use_new_flow_neutron_c
 
         if self.is_subsystem():
             raise ValueError(
@@ -126,20 +122,40 @@ class NeutronTargetSpec:
 
     # Whether the target has subsystem (Neutron-S) or not (Neutron-C).
     def is_subsystem(self) -> bool:
-        return self.neutron_target.subsystem
+        return (
+            self.neutron_target.npu.subsystem
+            if hasattr(self.neutron_target, "npu")
+            else self.neutron_target.subsystem
+        )
 
     # Number of compute units.
     def get_num_units(self) -> int:
-        return self.neutron_target.numUnits
+        return (
+            self.neutron_target.npu.numUnits
+            if hasattr(self.neutron_target, "npu")
+            else self.neutron_target.numUnits
+        )
 
     # Number of compute pipelines.
     def get_num_pipes(self) -> int:
-        return self.neutron_target.numPipes
+        return (
+            self.neutron_target.npu.numPipes
+            if hasattr(self.neutron_target, "npu")
+            else self.neutron_target.numPipes
+        )
 
     # Number of compute MACs.
     def get_num_macs(self) -> int:
-        return self.neutron_target.numMacs
+        return (
+            self.neutron_target.npu.numMacs
+            if hasattr(self.neutron_target, "npu")
+            else self.neutron_target.numMacs
+        )
 
     # Neutron compute block hardware version.
     def get_hw_version(self) -> NeutronHWVersion:
-        return NeutronHWVersion(self.neutron_target.hwVersion)
+        return NeutronHWVersion(
+            self.neutron_target.npu.hwVersion
+            if hasattr(self.neutron_target, "npu")
+            else self.neutron_target.hwVersion
+        )

@@ -183,6 +183,23 @@ class TestTensor(unittest.TestCase):
             with self.assertRaisesRegex(Exception, test_case[1], msg=f"{kwargs}"):
                 make_allocation_info(**kwargs)
 
+    def test_inplace_base_aliases_storage_base_at_offset_zero(self) -> None:
+        base = TensorSpec.from_tensor(torch.empty(4))
+        child = TensorSpec.from_tensor(torch.empty(4))
+
+        child.inplace_base = base
+
+        self.assertIs(child.storage_base, base)
+        self.assertEqual(child.storage_base_offset, 0)
+        self.assertIs(child.inplace_base, base)
+
+        child.storage_base_offset = 4
+        with self.assertRaisesRegex(Exception, "offset 0"):
+            child.inplace_base
+        with self.assertRaisesRegex(Exception, "storage_base_offset is 0"):
+            child.inplace_base = base
+        self.assertEqual(child.storage_base_offset, 4)
+
     def test_contiguous_stride_from_shape(self) -> None:
         shape = (2, 3, 4)
         stride = contiguous_stride_from_shape(torch.Size(shape))
@@ -387,6 +404,26 @@ class TestTensor(unittest.TestCase):
         expected_strides = [1, 1, 1, 1]
         strides = stride_from_dim_order(sizes, dim_order)
         self.assertEqual(expected_strides, strides)
+
+    def test_strides_from_dim_order_with_symbolic_sizes(self) -> None:
+        class ViewModule(torch.nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x.view(x.shape[0], -1)
+
+        exported_program = torch.export.export(
+            ViewModule(),
+            (torch.randn(2, 3, 4),),
+            dynamic_shapes={"x": {0: torch.export.Dim("batch", min=1, max=8)}},
+        )
+        placeholder = next(
+            node
+            for node in exported_program.graph_module.graph.nodes
+            if node.op == "placeholder"
+        )
+        sizes = list(placeholder.meta["val"].shape)
+
+        self.assertIsInstance(sizes[0], torch.SymInt)
+        self.assertEqual([12, 4, 1], stride_from_dim_order(sizes, [0, 1, 2]))
 
     def test_num_bytes_from_shape_and_dtype(self) -> None:
         shape = (2, 3, 4)

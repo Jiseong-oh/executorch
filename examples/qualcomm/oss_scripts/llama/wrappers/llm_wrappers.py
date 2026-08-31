@@ -9,10 +9,7 @@ import gc
 import inspect
 import json
 import logging
-import os
 import re
-import time
-import types
 
 from functools import partial
 from typing import Any, Dict, List
@@ -22,10 +19,7 @@ import torch
 from executorch.backends.qualcomm._passes import FoldQDQ, I64toI32, TagQuantIO
 from executorch.backends.qualcomm._passes.build_quant_io import BuildQuantIo
 from executorch.backends.qualcomm._passes.qnn_pass_manager import (
-    get_capture_program_passes,
-)
-from executorch.backends.qualcomm._passes.utils import (
-    get_passes_dependency_for_capture_program,
+    get_qnn_pass_manager_cls,
 )
 from executorch.backends.qualcomm.builders.utils import is_graph_output
 from executorch.backends.qualcomm.export_utils import make_quantizer
@@ -51,6 +45,11 @@ from executorch.examples.qualcomm.oss_scripts.llama import (
     LLM_VARIANT_ARCHS,
     LLMModelConfig,
 )
+from executorch.examples.qualcomm.oss_scripts.llama.dataset import (
+    DataConfig,
+    DatasetBuilder,
+    ModalityEncoderDataset,
+)
 from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     AUDIO_ENCODER,
     DECODE_QDQ_FILENAME,
@@ -61,15 +60,18 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     TOK_EMBEDDING_GRAPH_NAMES,
     VISION_ENCODER,
 )
-from executorch.examples.qualcomm.oss_scripts.llama.decoder_utils import (
-    _modality_inputs_merger,
-    graph_module_inference,
-)
 from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_config import (
     GraniteSpeechEncoder,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.encoder.encoder_quant_recipe import (
     EncoderQuantRecipe,
+)
+from executorch.examples.qualcomm.oss_scripts.llama.evaluator.lm_eval_adapter import (
+    run_lm_eval,
+)
+from executorch.examples.qualcomm.oss_scripts.llama.inference import (
+    DecoderInference,
+    EncoderInference,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.mix_precision_analyzer import (
     PerLayerSqnrAnalyzer,
@@ -82,9 +84,15 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
     LlamaModel,
     ModelArgs,
 )
+from executorch.examples.qualcomm.oss_scripts.llama.quantize import (
+    PTQStrategy,
+    QATStrategy,
+)
 from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe import (
     StaticLLMQuantRecipe,
 )
+from executorch.examples.qualcomm.oss_scripts.llama.tokenizer import TokenizerWrapper
+from executorch.examples.qualcomm.oss_scripts.llama.train.config import TrainingArgs
 from executorch.examples.qualcomm.oss_scripts.llama.wrappers.base_component import (
     Component,
     get_model_specific_kwargs,
@@ -100,16 +108,14 @@ from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from executorch.extension.llm.custom_ops import model_sharding
 from executorch.extension.llm.export.builder import DType
-from torchao.prototype.spinquant import apply_spinquant
-from torchao.quantization.pt2e import MinMaxObserver
-from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
-from transformers import (
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForSpeechSeq2Seq,
-    AutoModelForVision2Seq,
+from torch.utils.data import DataLoader
+from torchao.quantization.pt2e import MinMaxObserver, move_exported_model_to_train
+from torchao.quantization.pt2e.quantize_pt2e import (
+    convert_pt2e,
+    prepare_pt2e,
+    prepare_qat_pt2e,
 )
+from transformers import AutoModel, AutoModelForSpeechSeq2Seq
 
 
 def is_node_src_start_with_name(node: torch.fx.Node, kv_cache_prefix: str) -> bool:
@@ -158,44 +164,108 @@ class TextDecoder(Component):
         self.control_args = control_args
         self.config = config
         self.mode = mode
-        self.passes_job = get_capture_program_passes()
-        self.dep_table = get_passes_dependency_for_capture_program()
+        self.pass_manager_cls = get_qnn_pass_manager_cls()
+        self.passes_job = self.pass_manager_cls.get_capture_program_passes()
+        self.dep_table = (
+            self.pass_manager_cls.get_passes_dependency_for_capture_program()
+        )
         self.meta = {}
+        recipe_cls = (
+            self.config.qat_recipe
+            if control_args.qat and self.config.qat_recipe
+            else self.config.quant_recipe
+        )
         self.quant_recipe: StaticLLMQuantRecipe = (
-            self.config.quant_recipe(mode == Mode.CALIBRATE)
-            if self.config.quant_recipe
-            else None
+            recipe_cls(mode == Mode.CALIBRATE) if recipe_cls else None
         )
 
         # For multimodal embedding
         self.apply_embedding = apply_embedding
         self.tok_embedding_passes_job = (
-            get_capture_program_passes() if apply_embedding else None
+            self.pass_manager_cls.get_capture_program_passes()
+            if apply_embedding
+            else None
         )
         self.tok_embedding_dep_table = (
-            get_passes_dependency_for_capture_program() if apply_embedding else None
+            self.pass_manager_cls.get_passes_dependency_for_capture_program()
+            if apply_embedding
+            else None
         )
 
         # load static llama model args
-        params_path = (
-            config.params_path if control_args.params is None else control_args.params
-        )
-        with open(params_path) as f:
-            self.model_args = process_model_args(
-                control_args, ModelArgs(**json.load(f)), self.quant_recipe, config, mode
+        if control_args.decoder_model == "gemma4-e2b":
+            from executorch.examples.models.gemma4.text_decoder.gemma4_config import (
+                Gemma4Config,
             )
+
+            params_path = config.params_path
+            self.gemma4_config = Gemma4Config.from_json(params_path)
+            self.gemma4_config.use_kv_cache = True
+            self.gemma4_config.max_batch_size = 1
+            self.gemma4_config.max_seq_len = control_args.max_seq_len
+            self.gemma4_config.max_context_len = control_args.max_context_len
+            self.model_args = None
+        else:
+            params_path = (
+                config.params_path
+                if control_args.params is None
+                else control_args.params
+            )
+            with open(params_path) as f:
+                self.model_args = process_model_args(
+                    control_args,
+                    ModelArgs(**json.load(f)),
+                    self.quant_recipe,
+                    config,
+                    mode,
+                )
         # prepare instance
         self.tok_embedding, self.decoder = self._prepare_model()
 
         # check if sharding required
         if self.decoder and self.config.num_sharding > 1:
+            layer_prefix_offsets = None
+            if self.control_args.decoder_model == "gemma4-e2b":
+                n_self = self.gemma4_config.num_self_decoder_layers
+                layer_prefix_offsets = {
+                    "model.self_decoder.layers": 0,
+                    "model.cross_decoder.layers": n_self,
+                }
             SplitGraph, setting = model_sharding.get_split_graph_pass(
                 self.meta["get_n_layers"],
                 shares=self.config.num_sharding,
+                pattern=self._get_sharding_get_pattern(),
+                layer_prefix_offsets=layer_prefix_offsets,
             )
             self.passes_job[SplitGraph] = setting
             self.dep_table[SplitGraph] = [FoldQDQ]
             self.dep_table[TagQuantIO] = [SplitGraph]
+
+        self._decoder_inference = (
+            DecoderInference(
+                get_example_inputs=self.get_example_inputs,
+                audio_token_id=self.meta.get("audio_token_id", None),
+                image_token_id=self.meta.get("image_token_id", None),
+                max_context_len=self.meta["get_max_context_len"],
+                max_batch_size=self.meta["get_max_batch_size"],
+                use_i64_token=self.control_args.embedding_quantize is not None,
+            )
+            if self.decoder is not None
+            else None
+        )
+
+    def _get_sharding_get_pattern(self):
+        if self.control_args.decoder_model == "gemma4-e2b":
+            prefixes = [
+                "model.cross_decoder.layers",
+                "model.self_decoder.layers",
+            ]
+        else:
+            prefixes = [
+                "layers",
+            ]
+        prefix_alt = "|".join(re.escape(p) for p in prefixes)
+        return rf"^(?:{prefix_alt})\.(\d+)"
 
     def _prepare_model(self):  # noqa: C901
         if (instance := self._get_model_instance()) is None:
@@ -203,24 +273,44 @@ class TextDecoder(Component):
         tok_embedding, decoder = instance
         # load parameters for HF models
         if self.control_args.checkpoint is None:
-            checkpoint = download_and_convert_hf_checkpoint(
-                self.config.repo_id,
-                self.config.convert_weights.__func__,
-            )
-            state_dict = torch.load(
-                checkpoint, weights_only=True, map_location="cpu", mmap=True
-            )
-            if self.control_args.decoder_model in {
-                "gemma-2b",
-                "gemma2-2b",
-                "gemma3-1b",
-            }:
+            if self.control_args.decoder_model == "gemma4-e2b":
+                from executorch.examples.qualcomm.oss_scripts.gemma4.text_decoder.convert_weights import (
+                    remap_keys,
+                )
+                from huggingface_hub import snapshot_download
+
+                state_dict = self.config.convert_weights.__func__(
+                    snapshot_download(repo_id=self.config.repo_id),
+                    self.gemma4_config,
+                    torch.float32,
+                )
+                state_dict = remap_keys(state_dict)
+            else:
+                checkpoint = download_and_convert_hf_checkpoint(
+                    self.config.repo_id,
+                    self.config.convert_weights.__func__,
+                )
+                state_dict = torch.load(
+                    checkpoint, weights_only=True, map_location="cpu", mmap=True
+                )
+                if self.control_args.decoder_model in {
+                    "gemma-2b",
+                    "gemma2-2b",
+                    "gemma3-1b",
+                }:
+                    for k, v in state_dict.items():
+                        if "norm" not in k:
+                            continue
+                        # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
+                        # See https://github.com/huggingface/transformers/pull/29402
+                        state_dict[k] = v.float() + torch.ones(
+                            v.shape, dtype=torch.float32
+                        )
                 for k, v in state_dict.items():
-                    if "norm" not in k:
-                        continue
-                    # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
-                    # See https://github.com/huggingface/transformers/pull/29402
-                    state_dict[k] = v.float() + torch.ones(v.shape, dtype=torch.float32)
+                    if "tok_embeddings.weight" == k:
+                        state_dict[k] = (
+                            v.float() * self.model_args.embedding_scale_factor
+                        )
         else:
             state_dict = torch.load(
                 self.control_args.checkpoint,
@@ -267,29 +357,18 @@ class TextDecoder(Component):
 
         decoder.load_state_dict(state_dict, strict=True, assign=True)
 
-        # apply spin quant if required
         if any([self.config.r1, self.config.r2]):
-            decoder.config = types.SimpleNamespace(
-                dim=decoder.dim,
-                head_dim=decoder.dim // decoder.n_heads,
-                n_local_heads=decoder.n_heads,
-                intermediate_size=4 * decoder.dim,
-            )
-            apply_spinquant(
-                decoder,
-                use_r1=self.config.r1,
-                use_r2=self.config.r2,
-                use_r4=False,
-                pretrained_rotation_path=None,
-                qkv_split=True,
+            raise RuntimeError(
+                "SpinQuant (r1/r2) is no longer supported: the "
+                "torchao.prototype.spinquant module has been deleted."
             )
 
         # perform model transformation
         for layer in decoder.layers:
             if getattr(layer.attention, "prepare_attention_conv", None):
                 layer.attention.prepare_attention_conv()
-            if getattr(layer.feed_forward, "prepare_feedfoward_conv", None):
-                layer.feed_forward.prepare_feedfoward_conv()
+            if getattr(layer.feed_forward, "prepare_feedforward_conv", None):
+                layer.feed_forward.prepare_feedforward_conv()
 
         decoder = convert_linear_to_conv2d(decoder)
 
@@ -300,16 +379,10 @@ class TextDecoder(Component):
 
         # check embedding fallback
         if self.control_args.embedding_quantize:
-            decoder = get_quant_embedding_transform(
-                embedding_quantize=self.control_args.embedding_quantize
-            )(decoder)
             self.passes_job[I64toI32][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
                 "skip_node"
             ] = {"tokens"}
             if self.apply_embedding:
-                tok_embedding = get_quant_embedding_transform(
-                    embedding_quantize=self.control_args.embedding_quantize
-                )(tok_embedding)
                 self.tok_embedding_passes_job[I64toI32][
                     QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY
                 ]["skip_node"] = {"tokens"}
@@ -348,16 +421,47 @@ class TextDecoder(Component):
             # For gemma, we have preprocessed the weight of rmsnorm
             self.model_args.norm_type = "rmsnorm"
 
-        decoder: LlamaModel = LLM_VARIANT_ARCHS.get(
-            self.control_args.decoder_model, LlamaModel
-        )(
-            self.model_args,
-            ar_len=self.model_args.ar_len,
-            output_new_cache_only=True,
-            output_cache=True,
-            use_i64_token=use_i64_token,
-            **get_model_specific_kwargs(self.control_args, self.config),
-        )
+        if self.control_args.decoder_model == "gemma4-e2b":
+            from executorch.examples.qualcomm.oss_scripts.gemma4.model_wrapper import (
+                Gemma4TextModelWrapper,
+            )
+
+            ar_len = (
+                self.control_args.prefill_ar_len
+                if self.mode == Mode.PREFILL
+                else (
+                    self.control_args.max_context_len
+                    if self.mode == Mode.CALIBRATE
+                    else 1
+                )
+            )
+            extra_kwargs = {
+                # 32 is the sentinel for "unquantized KV IO"; get_kv_io_bit_width()
+                # returns it too when the recipe has no default_quant_dtype.
+                "kv_io_bit_width": (
+                    self.quant_recipe.get_kv_io_bit_width() if self.quant_recipe else 32
+                ),
+            }
+            decoder: Gemma4TextModelWrapper = Gemma4TextModelWrapper(
+                self.gemma4_config,
+                ar_len=ar_len,
+                output_new_cache_only=True,
+                output_cache=True,
+                use_i64_token=use_i64_token,
+                enable_masked_softmax=False,
+                **extra_kwargs,
+            )
+        else:
+            decoder: LlamaModel = LLM_VARIANT_ARCHS.get(
+                self.control_args.decoder_model, LlamaModel
+            )(
+                self.model_args,
+                ar_len=self.model_args.ar_len,
+                output_new_cache_only=True,
+                output_cache=True,
+                use_i64_token=use_i64_token,
+                **get_model_specific_kwargs(self.control_args, self.config),
+            )
 
         self.meta = decoder.get_metadata()
         # get example input
@@ -379,14 +483,27 @@ class TextDecoder(Component):
             ),
         }
         # shape of k caches and v caches
-        self.kv_cache_shape = {
-            # single head, kv input
-            (self.meta["get_head_dim"], self.meta["get_max_context_len"]),
-            (self.meta["get_max_context_len"], self.meta["get_head_dim"]),
-            # single head, kv output
-            (self.meta["get_head_dim"], self.meta["get_ar_len"]),
-            (self.meta["get_ar_len"], self.meta["get_head_dim"]),
-        }
+        if self.control_args.decoder_model == "gemma4-e2b":
+            # Gemma 4 has per-layer head_dim: sliding=256, full=512
+            kv_head_dims = {
+                self.meta["get_head_dim"],
+                self.meta["get_global_head_dim"],
+            }
+            self.kv_cache_shape = set()
+            for head_dim in kv_head_dims:
+                self.kv_cache_shape.add((head_dim, self.meta["get_max_context_len"]))
+                self.kv_cache_shape.add((self.meta["get_max_context_len"], head_dim))
+                self.kv_cache_shape.add((head_dim, self.meta["get_ar_len"]))
+                self.kv_cache_shape.add((self.meta["get_ar_len"], head_dim))
+        else:
+            self.kv_cache_shape = {
+                # single head, kv input
+                (self.meta["get_head_dim"], self.meta["get_max_context_len"]),
+                (self.meta["get_max_context_len"], self.meta["get_head_dim"]),
+                # single head, kv output
+                (self.meta["get_head_dim"], self.meta["get_ar_len"]),
+                (self.meta["get_ar_len"], self.meta["get_head_dim"]),
+            }
 
         if self.apply_embedding:
             self.tok_embedding_export_input = (
@@ -394,6 +511,11 @@ class TextDecoder(Component):
             )  # tokens
 
         return tok_embedding, decoder
+
+    @property
+    def attn_mask(self):
+        """Attention mask for this decoder graph, used as a schema for dataset construction."""
+        return self.example_input[1]
 
     def _save_logits_quant_attrs(self):
         for node in self.decoder.graph.nodes:
@@ -427,10 +549,11 @@ class TextDecoder(Component):
                 ]
                 kv_idx += 1
 
-    def _tag_ios(self, node, fixed_point_type):
+    def _tag_ios(self, node, fixed_point_type):  # noqa: C901
         atten_mask_shape = {
             (
                 self.meta["get_max_batch_size"],
+                1,  # num_heads=1: the mask broadcasts across all heads.
                 self.meta["get_ar_len"],
                 self.meta["get_max_context_len"],
             ),
@@ -439,15 +562,18 @@ class TextDecoder(Component):
         freq_shape = {
             (self.meta["get_ar_len"], self.meta["get_head_dim"] // 2),
         }
+        if self.control_args.decoder_model == "gemma4-e2b":
+            freq_shape.add(
+                (self.meta["get_ar_len"], self.meta["get_global_head_dim"] // 2)
+            )
 
-        freq_op = {
-            exir_ops.edge.aten.select.int,
-        }
+        freq_op = {exir_ops.edge.aten.select.int, exir_ops.edge.aten.select_copy.int}
         quant_io_type = None
 
         if node.op == "placeholder":
             if (
-                len(users := list(node.users)) == 1
+                len(users := list(node.users)) > 0
+                and "args_" in node.name
                 and users[0].meta["val"].size()[-2:] in self.kv_cache_shape
             ):
                 quant_io_type = fixed_point_type["kv_type"]
@@ -472,13 +598,35 @@ class TextDecoder(Component):
         if node.target in freq_op and node.meta["val"].size() in freq_shape:
             quant_io_type = fixed_point_type["io_type"]
 
+        # Matched against stack_trace source text, so this is coupled to the
+        # variable names in model forward: renaming per_layer_inputs or
+        # changing how it is sliced silently drops the tag.
+        if (
+            self.control_args.decoder_model == "gemma4-e2b"
+            and "stack_trace" in node.meta
+            and (
+                "per_layer_inputs[n_self:]" in node.meta["stack_trace"]
+                or "per_layer_inputs[i]" in node.meta["stack_trace"]
+            )
+        ):
+            quant_io_type = fixed_point_type["io_type"]
+
+        # Tag the donor K/V that YOCO shared layers consume.
+        #
+        # Matched on full_k/full_v are the local variable names in model forward.
+        # Renaming them drops the tag.
+        if self.control_args.decoder_model == "gemma4-e2b" and (
+            is_node_src_start_with_name(node, "full_k")
+            or is_node_src_start_with_name(node, "full_v")
+        ):
+            quant_io_type = fixed_point_type["io_type"]
         return quant_io_type
 
     def _quant_recipe_suggestion(
         self,
         fp32_gm: torch.fx.GraphModule,
         qdq_gm: torch.fx.GraphModule,
-        input_sample: tuple,
+        text_dataloader: DataLoader,
         recipe: StaticLLMQuantRecipe,
     ):
         """
@@ -499,148 +647,16 @@ class TextDecoder(Component):
             fp32_gm=fp32_gm,
             qdq_gm=qdq_gm,
             analysis_recipe=recipe,
-        ).analyze(input_sample)
+        ).analyze(
+            self._decoder_inference,
+            text_dataloader,
+        )
         report.save_analysis_summary()
         suggest_recipe_overrides = report.suggest_recipe_overrides()
         save_suggest_recipes(report, suggest_recipe_overrides)
 
-    def _auto_tune_calibration_threads(self):
-        """Find the optimal thread count for calibration via quick microbenchmark.
-
-        AR1 decode calibration is SGEMV-dominated (memory-bandwidth-bound).
-        The default thread count (os.cpu_count()) is typically far too high,
-        causing massive OpenMP sync overhead. This runs a few forward passes
-        at candidate thread counts and picks the fastest.
-        """
-        # Use sched_getaffinity when available — it respects cgroup/taskset
-        # constraints (e.g. containers), unlike os.cpu_count() which returns
-        # the host total regardless of pinning.
-        available = (
-            len(os.sched_getaffinity(0))
-            if hasattr(os, "sched_getaffinity")
-            else (os.cpu_count() or 1)
-        )
-        baseline = min(torch.get_num_threads(), available)
-        # Sample fractions of the thread ceiling from low through the
-        # bandwidth-saturation knee up to the current default.
-        fractions = (1 / 8, 1 / 4, 3 / 8, 1 / 2, 2 / 3, 3 / 4, 1.0)
-        candidates = sorted(
-            {1, baseline} | {max(1, round(baseline * f)) for f in fractions}
-        )
-        original = torch.get_num_threads()
-        best_threads, best_time = original, float("inf")
-        try:
-            for n_threads in candidates:
-                torch.set_num_threads(n_threads)
-                try:
-                    with torch.no_grad():
-                        self.decoder(*self.export_input)  # warmup
-                        t0 = time.perf_counter()
-                        for _ in range(3):
-                            self.decoder(*self.export_input)
-                        elapsed = time.perf_counter() - t0
-                    if elapsed < best_time:
-                        best_threads, best_time = n_threads, elapsed
-                except Exception:
-                    logging.debug("Auto-tune: threads=%d failed, skipping", n_threads)
-                    continue
-        finally:
-            torch.set_num_threads(original)
-        if best_time == float("inf"):
-            logging.warning(
-                "Auto-tune: all candidates %s failed, falling back to %d threads",
-                candidates,
-                baseline,
-            )
-            return baseline
-        logging.info(
-            "Auto-tune calibration threads: tested %s, best=%d (%.1fms/fwd)",
-            candidates,
-            best_threads,
-            best_time / 3 * 1000,
-        )
-        return best_threads
-
-    def _calibrate(
-        self,
-        model,
-        tokenizer,
-        event,
-        user_calibration_data,
-        tok_embedding=None,
-        intermediate_outputs=None,
-        collect_input_samples=False,
-    ):
-        """
-        Calibrate the model using either task-based evaluation or prompt-based inference.
-
-        This method performs Post-Training Quantization (PTQ) calibration by running inference
-        on the model with either:
-        1. Task-based datasets by lm_eval for text-only models in perplexity evaluation
-        2. User-provided prompts for both text-only and multimodal models
-
-        Args:
-            model: The decoder model to calibrate (GraphModule after prepare_pt2e)
-            tokenizer: Tokenizer for encoding text inputs
-            event: Event name for logging (e.g., "prepare_pt2e", "convert_pt2e")
-            tok_embedding: Optional text embedding module (required only for multimodal models)
-            intermediate_outputs: Optional pre-computed embeddings from vision/audio encoder
-                                 (required only for multimodal models)
-        """
-        # Determine if this is a multimodal model
-        is_multimodal = tok_embedding is not None
-
-        # Determine if task-based calibration is requested
-        has_task_calibration = self.control_args.tasks is not None
-
-        # Task-based calibration: Only for text-only LLMs
-        # Multimodal models (VLMs) cannot use task-based evaluation currently.
-        input_samples = []
-        if has_task_calibration and not is_multimodal:
-            result = graph_module_inference(
-                use_kv_cache=self.meta["get_use_kv_cache"],
-                get_example_inputs=self.get_example_inputs,
-                module=model,
-                tokenizer=tokenizer,
-                ar_len=self.meta["get_ar_len"],
-                max_seq_len=self.meta["get_max_context_len"],
-                tasks=self.control_args.tasks,
-                tasks_limit=self.control_args.limit,
-                num_fewshot=self.control_args.num_fewshot,
-                use_i64_token=self.control_args.embedding_quantize is not None,
-                event_name=f"{event}_tasks",
-                seq_mse_candidates=self.config.seq_mse_candidates,
-                collect_input_samples=collect_input_samples,
-            )
-            if result.input_samples:
-                input_samples.extend(result.input_samples)
-
-        # the user's prompt helps calibrate the special tokens.
-        if user_calibration_data:
-            for turn in zip(intermediate_outputs, user_calibration_data):
-                hidden_states, prompt = turn
-                result = graph_module_inference(
-                    use_kv_cache=self.meta["get_use_kv_cache"],
-                    get_example_inputs=self.get_example_inputs,
-                    hidden_states=hidden_states,  # hidden_states for multimodal
-                    module=model,
-                    tok_embedding=tok_embedding,
-                    audio_token_id=self.meta.get("audio_token_id", None),
-                    image_token_id=self.meta.get("image_token_id", None),
-                    tokenizer=tokenizer,
-                    ar_len=self.meta["get_ar_len"],
-                    max_seq_len=self.meta["get_max_context_len"],
-                    prompt=torch.Tensor(prompt).to(torch.long),
-                    use_i64_token=self.control_args.embedding_quantize is not None,
-                    event_name=f"{event}_prompt",
-                    collect_input_samples=collect_input_samples,
-                )
-                if result.input_samples:
-                    input_samples.extend(result.input_samples)
-        return input_samples
-
     @log_info
-    def quantize(self, request: Request, calibration_tokens=None):  # noqa: C901
+    def quantize(self, request: Request):  # noqa: C901
         if self.quant_recipe is None:
             return
 
@@ -672,6 +688,16 @@ class TextDecoder(Component):
                     f"unknown logits io bit width {self.quant_recipe.get_logits_output_bit_width()}"
                 )
 
+        # embedding fallback and quantization
+        if self.control_args.embedding_quantize:
+            self.decoder = get_quant_embedding_transform(
+                embedding_quantize=self.control_args.embedding_quantize
+            )(self.decoder)
+            if self.apply_embedding:
+                self.tok_embedding = get_quant_embedding_transform(
+                    embedding_quantize=self.control_args.embedding_quantize
+                )(self.tok_embedding)
+
         data = request.method_data[TEXT_DECODER]
 
         quantizer = make_quantizer(backend=data.backend, soc_model=data.soc_model)
@@ -685,13 +711,14 @@ class TextDecoder(Component):
             soc_model=data.soc_model,
         )
 
+        use_qat = self.control_args.qat and self.mode == Mode.CALIBRATE
         with torch.no_grad():
+            graph_module = None
             self.decoder = torch.export.export(
                 self.decoder, self.export_input, strict=True
             ).module()
-            if (
-                self.mode == Mode.CALIBRATE
-                and self.control_args.quant_recipe_suggestion
+            if self.mode == Mode.CALIBRATE and (
+                self.control_args.quant_recipe_suggestion or use_qat
             ):
                 graph_module = copy.deepcopy(self.decoder)
             if self.apply_embedding:
@@ -701,40 +728,79 @@ class TextDecoder(Component):
                     strict=True,
                 ).module()
 
-            self.decoder = prepare_pt2e(self.decoder, quantizer)
+            if (
+                self.control_args.verbose
+                and self.mode == Mode.CALIBRATE
+                and not self.apply_embedding
+            ):
+                run_lm_eval(
+                    module=self.decoder,
+                    get_example_inputs=self.get_example_inputs,
+                    tokenizer=data.tokenizer,
+                    max_seq_length=self.meta["get_max_context_len"],
+                    tasks=self.control_args.eval_tasks,
+                    use_i64_token=self.control_args.embedding_quantize is not None,
+                    num_fewshot=self.control_args.eval_num_fewshot,
+                    limit=self.control_args.eval_limit,
+                    max_batch_size=self.meta["get_max_batch_size"],
+                    event_name="export_tasks",
+                )
+
+            if use_qat:
+                self.decoder = prepare_qat_pt2e(self.decoder, quantizer)
+                move_exported_model_to_train(self.decoder)
+            else:
+                self.decoder = prepare_pt2e(self.decoder, quantizer)
             if self.apply_embedding:
                 self.tok_embedding = prepare_pt2e(
                     self.tok_embedding, tok_embedding_quantizer
                 )
 
             if self.mode == Mode.CALIBRATE:
-                audio_turns = request.method_data[
-                    AUDIO_ENCODER
-                ].calibration_data.intermediate_outputs
-                vision_turns = request.method_data[
-                    VISION_ENCODER
-                ].calibration_data.intermediate_outputs
-                if audio_turns is None:
-                    audio_turns = [
-                        [] for _ in range(len(data.calibration_data.datasets))
-                    ]
-                if vision_turns is None:
-                    vision_turns = [
-                        [] for _ in range(len(data.calibration_data.datasets))
-                    ]
-                intermediate_outputs = [
-                    [*audio_turn, *vision_turn]
-                    for audio_turn, vision_turn in zip(audio_turns, vision_turns)
-                ]
-                input_samples = self._calibrate(
-                    model=self.decoder,
-                    tokenizer=data.tokenizer,
-                    event="prepare_pt2e",
-                    user_calibration_data=calibration_tokens,
-                    tok_embedding=self.tok_embedding,
-                    intermediate_outputs=intermediate_outputs,
-                    collect_input_samples=self.control_args.quant_recipe_suggestion,
-                )
+                calibration_dataloaders = {
+                    AUDIO_ENCODER: request.method_data[
+                        AUDIO_ENCODER
+                    ].quantization_data.intermediate_outputs,
+                    VISION_ENCODER: request.method_data[
+                        VISION_ENCODER
+                    ].quantization_data.intermediate_outputs,
+                    TEXT_DECODER: data.quantization_data.calib_loader,
+                }
+
+                if use_qat:
+                    training_args = TrainingArgs.from_yaml(
+                        self.control_args.train_config
+                    )
+                    training_args.lr_config = self.control_args.lr_config
+                    frozen = (
+                        [".*"]
+                        if self.control_args.freeze_all_params
+                        # freeze_all_params: CI-only flag to verify QAT vs PTQ accuracy difference
+                        # by disabling weight updates and only updating scale/zero_point.
+                        else getattr(self.quant_recipe, "frozen_param_patterns", None)
+                    )
+                    QATStrategy(
+                        inference=self._decoder_inference,
+                        module=self.decoder,
+                        tok_embedding=self.tok_embedding,
+                        seq_mse_candidates=self.config.seq_mse_candidates,
+                    ).quantize(
+                        calib_loader=calibration_dataloaders,
+                        training_args=training_args,
+                        teacher=graph_module,
+                        train_loader=data.quantization_data.train_loader,
+                        val_loader=data.quantization_data.val_loader,
+                        frozen_param_patterns=frozen,
+                    )
+                    logging.info("QAT training complete")
+                else:
+                    PTQStrategy(
+                        inference=self._decoder_inference,
+                        module=self.decoder,
+                        tok_embedding=self.tok_embedding,
+                        seq_mse_candidates=self.config.seq_mse_candidates,
+                    ).quantize(calib_loader=calibration_dataloaders)
+                    logging.info("Calibration complete")
             else:
                 # one dummy inference to remove affine observer
                 # error happened in convert_pt2e
@@ -749,39 +815,33 @@ class TextDecoder(Component):
                 self._quant_recipe_suggestion(
                     graph_module,
                     self.decoder,
-                    input_samples,
+                    calibration_dataloaders[TEXT_DECODER],
                     self.quant_recipe.recipe,
                 )
+
+            # FP32 model used as QAT teacher or quant-recipe-suggestion reference; release after use.
+            del graph_module
+            gc.collect()
 
             if self.apply_embedding:
                 self.tok_embedding = convert_pt2e(self.tok_embedding)
 
-            if self.control_args.verbose and self.mode == Mode.CALIBRATE:
-                audio_turns = request.method_data[
-                    AUDIO_ENCODER
-                ].calibration_data.qdq_intermediate_outputs
-                vision_turns = request.method_data[
-                    VISION_ENCODER
-                ].calibration_data.qdq_intermediate_outputs
-                if audio_turns is None:
-                    audio_turns = [
-                        [] for _ in range(len(data.calibration_data.datasets))
-                    ]
-                if vision_turns is None:
-                    vision_turns = [
-                        [] for _ in range(len(data.calibration_data.datasets))
-                    ]
-                qdq_intermediate_outputs = [
-                    [*audio_turn, *vision_turn]
-                    for audio_turn, vision_turn in zip(audio_turns, vision_turns)
-                ]
-                self._calibrate(
-                    model=self.decoder,
+            if (
+                self.control_args.verbose
+                and self.mode == Mode.CALIBRATE
+                and not self.apply_embedding
+            ):
+                run_lm_eval(
+                    module=self.decoder,
+                    get_example_inputs=self.get_example_inputs,
                     tokenizer=data.tokenizer,
-                    event="convert_pt2e",
-                    user_calibration_data=calibration_tokens,
-                    tok_embedding=self.tok_embedding,
-                    intermediate_outputs=qdq_intermediate_outputs,
+                    max_seq_length=self.meta["get_max_context_len"],
+                    tasks=self.control_args.eval_tasks,
+                    use_i64_token=self.control_args.embedding_quantize is not None,
+                    num_fewshot=self.control_args.eval_num_fewshot,
+                    limit=self.control_args.eval_limit,
+                    max_batch_size=self.meta["get_max_batch_size"],
+                    event_name="convert_pt2e_tasks",
                 )
 
         # setup quantized IO
@@ -818,8 +878,13 @@ class HybridTextDecoder(Component):
             Mode.PREFILL,
             apply_embedding=apply_embedding,
         )
-        self.calibration_prefill = TextDecoder(  # for quantization only
-            control_args, config, Mode.CALIBRATE, apply_embedding=apply_embedding
+        # Full AR sequence with KV cache; used only for quantization.
+        # Scales/zp collected here are propagated to decode and prefill graphs via _encoding_override.
+        self.calibration_prefill = TextDecoder(
+            control_args,
+            config,
+            Mode.CALIBRATE,
+            apply_embedding=apply_embedding,
         )
 
         self.control_args = control_args
@@ -828,7 +893,12 @@ class HybridTextDecoder(Component):
 
         self.apply_embedding = apply_embedding
 
-    def _encoding_override(self, quantized_model, unquantized_model):  # noqa: C901
+    def _encoding_override(  # noqa: C901
+        self,
+        quantized_model,
+        unquantized_model,
+        override_kv_cache,
+    ):
         pbq_target = {
             torch.ops.torchao.dequantize_affine,
             torch.ops.torchao.quantize_affine,
@@ -880,10 +950,26 @@ class HybridTextDecoder(Component):
                     activation_override(quantized_user, unquantized_user)
 
         def parameter_override(quantized_node, unquantized_node):
-            setattr(
+            # Some parameters need to be iterated over to retrieve attributes such as static_llama.tok_embedding.weight
+            def _get_attr(graph_module: torch.fx.GraphModule, target: str) -> Any:
+                attr: Any = graph_module
+                for target_atom in target.split("."):
+                    attr = getattr(attr, target_atom)
+                return attr
+
+            def _set_attr(
+                graph_module: torch.fx.GraphModule, target: str, replacement: Any
+            ) -> Any:
+                attr: Any = graph_module
+                target_list = target.split(".")
+                for target_atom in target_list[:-1]:
+                    attr = getattr(attr, target_atom)
+                setattr(attr, target_list[-1], replacement)
+
+            _set_attr(
                 unquantized_model,
                 unquantized_node.target,
-                getattr(quantized_model, quantized_node.target),
+                _get_attr(quantized_model, quantized_node.target),
             )
             # scale / zero point are part of op's attributes
             if list(quantized_node.users)[0].target in ptq_target:
@@ -920,197 +1006,66 @@ class HybridTextDecoder(Component):
         for param_quantized, param_unquantized in zip(*[p.keys() for p in parameters]):
             parameter_override(param_quantized, param_unquantized)
 
-        k_input_cache_nodes = []
-        v_input_cache_nodes = []
-        for node in unquantized_model.graph.nodes:
-            if node.op != "placeholder":
-                continue
+        if override_kv_cache:
+            k_input_cache_nodes = []
+            v_input_cache_nodes = []
+            for node in unquantized_model.graph.nodes:
+                if node.op != "placeholder":
+                    continue
 
-            if "args_" in node.name:
-                args_idx = int(node.name.split("_")[-1])
+                if "args_" in node.name:
+                    args_idx = int(node.name.split("_")[-1])
 
-                if args_idx >= self.decode.meta["get_n_layers"]:
-                    v_input_cache_nodes.append(node)
-                else:
-                    k_input_cache_nodes.append(node)
+                    n_cache_layers = (
+                        self.decode.meta["get_n_self_layers"]
+                        if self.control_args.decoder_model == "gemma4-e2b"
+                        else self.decode.meta["get_n_layers"]
+                    )
+                    if args_idx >= n_cache_layers:
+                        v_input_cache_nodes.append(node)
+                    else:
+                        k_input_cache_nodes.append(node)
 
-        if not k_input_cache_nodes or not v_input_cache_nodes:
-            raise RuntimeError(
-                "KV cache input detection failed. This likely means the model naming "
-                "does not match expected prefixes."
-            )
+            if not k_input_cache_nodes or not v_input_cache_nodes:
+                raise RuntimeError(
+                    "KV cache input detection failed. This likely means the model naming "
+                    "does not match expected prefixes."
+                )
 
-        k_output_cache_nodes = []
-        v_output_cache_nodes = []
-        for node in quantized_model.graph.nodes:
-            if not is_graph_output(node):
-                continue
-            cache_output_node = node.args[0].args[0]
-            if is_node_src_start_with_name(cache_output_node, kv_cache_prefix="k_"):
-                k_output_cache_nodes.append(cache_output_node)
-            elif is_node_src_start_with_name(cache_output_node, kv_cache_prefix="v_"):
-                v_output_cache_nodes.append(cache_output_node)
+            k_output_cache_nodes = []
+            v_output_cache_nodes = []
+            for node in quantized_model.graph.nodes:
+                if not is_graph_output(node):
+                    continue
+                cache_output_node = node.args[0].args[0]
+                if is_node_src_start_with_name(cache_output_node, kv_cache_prefix="k_"):
+                    k_output_cache_nodes.append(cache_output_node)
+                elif is_node_src_start_with_name(
+                    cache_output_node, kv_cache_prefix="v_"
+                ):
+                    v_output_cache_nodes.append(cache_output_node)
 
-        if not k_output_cache_nodes or not v_output_cache_nodes:
-            raise RuntimeError(
-                "KV cache detection failed. This likely means the model naming "
-                "does not match expected prefixes."
-            )
+            if not k_output_cache_nodes or not v_output_cache_nodes:
+                raise RuntimeError(
+                    "KV cache detection failed. This likely means the model naming "
+                    "does not match expected prefixes."
+                )
 
-        for input_k_cache_node, output_k_cache_node in zip(
-            k_input_cache_nodes, k_output_cache_nodes
-        ):
-            activation_override(output_k_cache_node, input_k_cache_node)
-        for input_v_cache_node, output_v_cache_node in zip(
-            v_input_cache_nodes, v_output_cache_nodes
-        ):
-            activation_override(output_v_cache_node, input_v_cache_node)
+            for input_k_cache_node, output_k_cache_node in zip(
+                k_input_cache_nodes, k_output_cache_nodes
+            ):
+                activation_override(output_k_cache_node, input_k_cache_node)
+            for input_v_cache_node, output_v_cache_node in zip(
+                v_input_cache_nodes, v_output_cache_nodes
+            ):
+                activation_override(output_v_cache_node, input_v_cache_node)
 
         unquantized_model.recompile()
-
-    def _generate_tokens_from_hf(self, model: AutoModel, data, intermediate_outputs):
-        from pytorch_tokenizers.tiktoken import TiktokenTokenizer
-
-        tok_embedding = self.decode.tok_embedding
-        audio_token_id = self.decode.meta.get("audio_token_id")
-        image_token_id = self.decode.meta.get("image_token_id")
-        use_i64_token = self.decode.control_args.embedding_quantize is not None
-        max_seq_len = self.decode.meta["get_max_context_len"]
-        tokenizer = data.tokenizer
-        is_multimodal = all(
-            [
-                tok_embedding,
-                audio_token_id or image_token_id,
-            ]
-        )
-
-        calibration_tokens = []
-        for hidden_states, prompt in zip(
-            intermediate_outputs, data.calibration_data.datasets
-        ):
-            if isinstance(tokenizer, TiktokenTokenizer):
-                token_ids = tokenizer.encode(
-                    prompt, bos=True, eos=False, allowed_special="all"
-                )
-            else:
-                token_ids = tokenizer.encode(prompt, bos=True, eos=False)
-            input_ids = torch.tensor([token_ids], dtype=torch.int64)
-
-            with torch.no_grad():
-                if is_multimodal and hidden_states:
-                    token_dtype = torch.int64 if use_i64_token else torch.int32
-                    text_embeds = tok_embedding(input_ids.to(token_dtype))
-                    merged_embeds = _modality_inputs_merger(
-                        input_ids,
-                        text_embeds,
-                        torch.cat(hidden_states, dim=1),
-                        audio_token_id or image_token_id,
-                    )
-                    generated_ids = model.generate(
-                        inputs_embeds=merged_embeds,
-                        max_new_tokens=max_seq_len - len(token_ids),
-                        eos_token_id=tokenizer.eos_id,
-                        do_sample=False,
-                    )
-                    full_tokens = token_ids + generated_ids[0].tolist()
-                else:
-                    output_ids = model.generate(
-                        input_ids=input_ids,
-                        max_new_tokens=max_seq_len - len(token_ids),
-                        eos_token_id=tokenizer.eos_id,
-                        do_sample=False,
-                    )
-                    full_tokens = output_ids[0].tolist()
-
-            calibration_tokens.append(full_tokens)
-
-        return calibration_tokens
-
-    def _generate_calibration_tokens(self, request: Request):
-        data = request.method_data[TEXT_DECODER]
-        audio_turns = request.method_data[
-            AUDIO_ENCODER
-        ].calibration_data.intermediate_outputs
-        vision_turns = request.method_data[
-            VISION_ENCODER
-        ].calibration_data.intermediate_outputs
-        if audio_turns is None:
-            audio_turns = [[] for _ in range(len(data.calibration_data.datasets))]
-        if vision_turns is None:
-            vision_turns = [[] for _ in range(len(data.calibration_data.datasets))]
-        intermediate_outputs = [
-            [*audio_turn, *vision_turn]
-            for audio_turn, vision_turn in zip(audio_turns, vision_turns)
-        ]
-
-        if self.config.repo_id:
-            if self.control_args.decoder_model == "smolvlm_500m_instruct":
-                hf_model = AutoModelForVision2Seq.from_pretrained(
-                    self.config.repo_id, torch_dtype=torch.float32
-                )
-
-            elif self.control_args.decoder_model == "internvl3_1b":
-                hf_model = AutoModelForImageTextToText.from_pretrained(
-                    self.config.repo_id, torch_dtype=torch.float32
-                )
-
-            elif self.control_args.decoder_model == "granite_speech_3_3-2b":
-                hf_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                    self.config.repo_id, torch_dtype=torch.float32
-                )
-            else:
-                hf_model = AutoModelForCausalLM.from_pretrained(
-                    self.config.repo_id,
-                )
-            calibration_tokens = self._generate_tokens_from_hf(
-                model=hf_model,
-                data=data,
-                intermediate_outputs=intermediate_outputs,
-            )
-        else:
-            # Auto-tune thread count for the without-cache calibration pass.
-            calib_threads = getattr(self.control_args, "calibration_num_threads", 0)
-            if calib_threads <= 0:
-                calib_threads = self.decode._auto_tune_calibration_threads()
-            original_threads = torch.get_num_threads()
-            torch.set_num_threads(calib_threads)
-            try:
-                calibration_tokens = []
-                for hidden_states, prompt in zip(
-                    intermediate_outputs, data.calibration_data.datasets
-                ):
-                    result = graph_module_inference(
-                        use_kv_cache=self.decode.meta["get_use_kv_cache"],
-                        get_example_inputs=self.decode.get_example_inputs,
-                        hidden_states=hidden_states,
-                        module=self.decode.decoder,
-                        tok_embedding=self.decode.tok_embedding,
-                        image_token_id=self.decode.meta.get("image_token_id", None),
-                        tokenizer=data.tokenizer,
-                        ar_len=self.decode.meta["get_ar_len"],
-                        max_seq_len=self.decode.meta["get_max_context_len"],
-                        prompt=prompt,
-                        use_i64_token=self.decode.control_args.embedding_quantize
-                        is not None,
-                        event_name="generated_user_prompt",
-                    )
-                    calibration_tokens.append(result.token_list)
-            finally:
-                torch.set_num_threads(original_threads)
-
-        return calibration_tokens
 
     def quantize(self, request: Request):
         if request.method_data[TEXT_DECODER].skip_quantize:
             return
-
-        if self.control_args.skip_user_prompt_calibration:
-            calibration_tokens = None
-        else:
-            calibration_tokens = self._generate_calibration_tokens(request)
-        self.calibration_prefill.quantize(
-            request, calibration_tokens=calibration_tokens
-        )
+        self.calibration_prefill.quantize(request)
 
     @log_info
     def compile(self, request: Request):  # noqa: C901
@@ -1127,6 +1082,7 @@ class HybridTextDecoder(Component):
             self._encoding_override(
                 quantized_model=self.calibration_prefill.decoder,
                 unquantized_model=self.decode.decoder,
+                override_kv_cache=True,
             )
 
             # save logit's quantization attributes to meta
@@ -1139,30 +1095,42 @@ class HybridTextDecoder(Component):
                 self._encoding_override(
                     quantized_model=self.calibration_prefill.tok_embedding,
                     unquantized_model=self.decode.tok_embedding,
+                    override_kv_cache=False,
                 )
 
             # Saving Decode QDQ Model EP for SQNR evaluation
             qdq_ep = torch.export.export(
-                self.decode.decoder, self.decode.export_input, strict=True
+                self.calibration_prefill.decoder,
+                self.calibration_prefill.export_input,
+                strict=True,
             )
             qdq_ep_path = f"{self.decode.control_args.artifact}/{DECODE_QDQ_FILENAME}"
             torch.export.save(qdq_ep, qdq_ep_path)
             logging.info(f"QDQ EP saved to {qdq_ep_path}")
 
+            if self.apply_embedding:
+                self._encoding_override(
+                    quantized_model=self.calibration_prefill.tok_embedding,
+                    unquantized_model=self.decode.tok_embedding,
+                    override_kv_cache=False,
+                )
+
             # For hybrid mode, override encoding of prefill model.
             if (
                 self.prefill.decoder is not None
-                and self.prefill.model_args.use_kv_cache
+                and self.prefill.meta["get_use_kv_cache"]
             ):
                 self._encoding_override(
                     quantized_model=self.decode.decoder,
                     unquantized_model=self.prefill.decoder,
+                    override_kv_cache=True,
                 )
 
                 if self.apply_embedding:
                     self._encoding_override(
                         quantized_model=self.decode.tok_embedding,
                         unquantized_model=self.prefill.tok_embedding,
+                        override_kv_cache=False,
                     )
 
         # calibration_prefill is only used for encoding override
@@ -1312,8 +1280,13 @@ class Modality(Component):
             # metadata
             self.config = config
 
-        self.passes_job = get_capture_program_passes()
-        self.dep_table = get_passes_dependency_for_capture_program()
+            self._encoder_inference = EncoderInference()
+
+        self.pass_manager_cls = get_qnn_pass_manager_cls()
+        self.passes_job = self.pass_manager_cls.get_capture_program_passes()
+        self.dep_table = (
+            self.pass_manager_cls.get_passes_dependency_for_capture_program()
+        )
 
     def _tag_ios(self, node, fixed_point_type):
         quant_io_type = None
@@ -1360,7 +1333,7 @@ class Modality(Component):
             self.dep_table[TagQuantIO] = [SplitGraph]
 
             if not request_data.skip_quantize:
-                fixed_point_type = {"io_type": torch.uint16}
+                fixed_point_type = {"io_type": torch.float32}
 
                 # setup quantized IO
                 self.passes_job[TagQuantIO][QCOM_PASS_ACTIVATE_KEY] = True
@@ -1393,17 +1366,25 @@ class Modality(Component):
 
     def _calibrate(self, model, calibration_datasets):
         outputs = []
-        for turn in calibration_datasets:
-            outputs_each_turn = [model(*data) for data in turn]
-            outputs.append(outputs_each_turn)
-        return outputs
+        for batch in calibration_datasets:
+            outputs_each_batch = [
+                self._encoder_inference.predict_step(model, data)
+                for data in batch["inputs"]
+            ]
+            outputs.append(outputs_each_batch)
+        return DataLoader(
+            ModalityEncoderDataset(outputs),
+            batch_size=self.control_args.batch_size,
+            shuffle=False,
+            drop_last=self.control_args.batch_size > 1,
+        )
 
     def quantize(self, request: Request):
         if self.model is None:
             return
 
         request_data = request.method_data[self.modality]
-        calibration_datasets = request_data.calibration_data.datasets
+        calibration_datasets = request_data.quantization_data.calib_loader
 
         with torch.no_grad():
             self.model = torch.export.export(self.model, self.example_input).module()
@@ -1411,7 +1392,7 @@ class Modality(Component):
             if request_data.skip_quantize:
                 logging.info(f"skipping encoder quantization for {self.modality}")
                 intermediate_outputs = self._calibrate(self.model, calibration_datasets)
-                request_data.calibration_data.intermediate_outputs = (
+                request_data.quantization_data.intermediate_outputs = (
                     intermediate_outputs
                 )
                 return
@@ -1424,7 +1405,7 @@ class Modality(Component):
 
             # start calibration
             intermediate_outputs = self._calibrate(self.model, calibration_datasets)
-            request_data.calibration_data.intermediate_outputs = intermediate_outputs
+            request_data.quantization_data.intermediate_outputs = intermediate_outputs
 
             self.model = convert_pt2e(self.model)
 
@@ -1433,13 +1414,15 @@ class Modality(Component):
                 qdq_intermediate_outputs = self._calibrate(
                     self.model, calibration_datasets
                 )
-                request_data.calibration_data.qdq_intermediate_outputs = (
+                request_data.quantization_data.qdq_intermediate_outputs = (
                     qdq_intermediate_outputs
                 )
 
 
 class MultiModalManager(Component):
     def __init__(self, control_args: argparse.Namespace, config: LLMModelConfig):
+        self.control_args = control_args
+        self.config = config
         self.audio_encoder = Modality(
             control_args,
             config,
@@ -1498,21 +1481,38 @@ class MultiModalManager(Component):
     @log_info
     def quantize(
         self,
-        calibration_data: Dict[str, List[Any]],
+        tokenizer_wrapper: TokenizerWrapper,
         skip_quantize: Dict[str, bool],
-        tokenizer,
         backend,
         soc_model,
     ):
+        data_config = DataConfig.from_args(self.control_args)
+        dataset_builder = DatasetBuilder(
+            data_config=data_config,
+            llm_config=self.config,
+            tokenizer_wrapper=tokenizer_wrapper,
+            attn_mask=self.text_decoder.calibration_prefill.attn_mask,
+        )
+        if self.control_args.qat:
+            calib_loader, train_loader, val_loader = (
+                dataset_builder.build_qat_dataloaders()
+            )
+        else:
+            calib_loader = dataset_builder.build_calib_dataloaders()
+            train_loader = dict.fromkeys(calib_loader)
+            val_loader = dict.fromkeys(calib_loader)
+
         quantize_request = Request(
             inspect.currentframe().f_code.co_name,
             {
                 m: Request.Data(
-                    calibration_data=Request.CalibrationData(
-                        datasets=calibration_data[m]
+                    quantization_data=Request.QuantizationData(
+                        calib_loader=calib_loader[m],
+                        train_loader=train_loader[m],
+                        val_loader=val_loader[m],
                     ),
                     skip_quantize=skip_quantize.get(m, False),
-                    tokenizer=tokenizer,
+                    tokenizer=tokenizer_wrapper.tokenizer,
                     backend=backend,
                     soc_model=soc_model,
                 )
